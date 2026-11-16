@@ -22,17 +22,20 @@ type StateMachine interface {
 	Restore([]byte)
 }
 
+type pendingRequest struct {
+	index int
+	done  chan any
+}
+
 type RSM struct {
 	mu           sync.Mutex
-	submitMu     sync.Mutex
 	me           int
 	rf           raftapi.Raft
 	applyCh      chan raftapi.ApplyMsg
 	maxraftstate int
 	sm           StateMachine
 	nextID       uint64
-	pendingIndex int
-	pending      chan any
+	pending      map[uint64]pendingRequest
 }
 
 func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, maxraftstate int, sm StateMachine) *RSM {
@@ -41,6 +44,7 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
+		pending:      make(map[uint64]pendingRequest),
 	}
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
@@ -54,9 +58,6 @@ func (rsm *RSM) Raft() raftapi.Raft {
 }
 
 func (rsm *RSM) Submit(req any) (rpc.Err, any) {
-	rsm.submitMu.Lock()
-	defer rsm.submitMu.Unlock()
-
 	rsm.mu.Lock()
 	rsm.nextID++
 	op := Op{Me: rsm.me, Id: rsm.nextID, Req: req}
@@ -66,8 +67,7 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 		return rpc.ErrWrongLeader, nil
 	}
 	done := make(chan any, 1)
-	rsm.pendingIndex = index
-	rsm.pending = done
+	rsm.pending[op.Id] = pendingRequest{index: index, done: done}
 	rsm.mu.Unlock()
 
 	return rpc.OK, <-done
@@ -82,9 +82,9 @@ func (rsm *RSM) readApply() {
 		result := rsm.sm.DoOp(op.Req)
 
 		rsm.mu.Lock()
-		if rsm.pending != nil && msg.CommandIndex == rsm.pendingIndex && op.Me == rsm.me && op.Id == rsm.nextID {
-			rsm.pending <- result
-			rsm.pending = nil
+		if pending, ok := rsm.pending[op.Id]; ok && op.Me == rsm.me && msg.CommandIndex == pending.index {
+			pending.done <- result
+			delete(rsm.pending, op.Id)
 		}
 		rsm.mu.Unlock()
 	}
