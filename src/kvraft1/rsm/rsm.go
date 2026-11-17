@@ -2,6 +2,7 @@ package rsm
 
 import (
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
@@ -24,6 +25,7 @@ type StateMachine interface {
 
 type pendingRequest struct {
 	index int
+	term  int
 	done  chan any
 }
 
@@ -36,6 +38,7 @@ type RSM struct {
 	sm           StateMachine
 	nextID       uint64
 	pending      map[uint64]pendingRequest
+	stopped      bool
 }
 
 func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, maxraftstate int, sm StateMachine) *RSM {
@@ -59,33 +62,77 @@ func (rsm *RSM) Raft() raftapi.Raft {
 
 func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	rsm.mu.Lock()
+	if rsm.stopped {
+		rsm.mu.Unlock()
+		return rpc.ErrWrongLeader, nil
+	}
 	rsm.nextID++
 	op := Op{Me: rsm.me, Id: rsm.nextID, Req: req}
-	index, _, leader := rsm.rf.Start(op)
+	index, term, leader := rsm.rf.Start(op)
 	if !leader {
 		rsm.mu.Unlock()
 		return rpc.ErrWrongLeader, nil
 	}
 	done := make(chan any, 1)
-	rsm.pending[op.Id] = pendingRequest{index: index, done: done}
+	rsm.pending[op.Id] = pendingRequest{index: index, term: term, done: done}
 	rsm.mu.Unlock()
 
-	return rpc.OK, <-done
+	result, ok := <-done
+	if !ok {
+		return rpc.ErrWrongLeader, nil
+	}
+	return rpc.OK, result
 }
 
 func (rsm *RSM) readApply() {
-	for msg := range rsm.applyCh {
-		if !msg.CommandValid {
-			continue
-		}
-		op := msg.Command.(Op)
-		result := rsm.sm.DoOp(op.Req)
-
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	defer func() {
 		rsm.mu.Lock()
-		if pending, ok := rsm.pending[op.Id]; ok && op.Me == rsm.me && msg.CommandIndex == pending.index {
-			pending.done <- result
-			delete(rsm.pending, op.Id)
+		defer rsm.mu.Unlock()
+		rsm.stopped = true
+		for id, pending := range rsm.pending {
+			close(pending.done)
+			delete(rsm.pending, id)
 		}
-		rsm.mu.Unlock()
+	}()
+	for {
+		select {
+		case msg, ok := <-rsm.applyCh:
+			if !ok {
+				return
+			}
+			if !msg.CommandValid {
+				continue
+			}
+			op := msg.Command.(Op)
+			result := rsm.sm.DoOp(op.Req)
+
+			rsm.mu.Lock()
+			for id, pending := range rsm.pending {
+				if msg.CommandIndex != pending.index {
+					continue
+				}
+				if op.Me == rsm.me && op.Id == id {
+					pending.done <- result
+				} else {
+					close(pending.done)
+				}
+				delete(rsm.pending, id)
+			}
+			rsm.mu.Unlock()
+		case <-ticker.C:
+			rsm.mu.Lock()
+			if len(rsm.pending) > 0 {
+				term, leader := rsm.rf.GetState()
+				for id, pending := range rsm.pending {
+					if !leader || term != pending.term {
+						close(pending.done)
+						delete(rsm.pending, id)
+					}
+				}
+			}
+			rsm.mu.Unlock()
+		}
 	}
 }

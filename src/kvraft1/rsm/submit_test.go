@@ -2,6 +2,7 @@ package rsm
 
 import (
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,18 +11,28 @@ import (
 )
 
 type submissionRaft struct {
+	mu      sync.Mutex
 	started chan raftapi.ApplyMsg
 	index   int
+	term    int
+	leader  bool
 }
 
 func (rf *submissionRaft) Start(command any) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if !rf.leader {
+		return -1, rf.term, false
+	}
 	rf.index++
 	rf.started <- raftapi.ApplyMsg{CommandValid: true, Command: command, CommandIndex: rf.index}
-	return rf.index, 1, true
+	return rf.index, rf.term, true
 }
 
 func (rf *submissionRaft) GetState() (int, bool) {
-	return 1, true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.term, rf.leader
 }
 
 func (rf *submissionRaft) Snapshot(int, []byte) {}
@@ -42,9 +53,9 @@ func (sm *echoStateMachine) Snapshot() []byte {
 
 func (sm *echoStateMachine) Restore([]byte) {}
 
-func TestConcurrentSubmissionResults(t *testing.T) {
-	const count = 32
-	rf := &submissionRaft{started: make(chan raftapi.ApplyMsg, count)}
+func makeSubmissionRSM(t *testing.T, count int) (*RSM, *submissionRaft, func()) {
+	t.Helper()
+	rf := &submissionRaft{started: make(chan raftapi.ApplyMsg, count), term: 1, leader: true}
 	rsm := &RSM{
 		rf:      rf,
 		applyCh: make(chan raftapi.ApplyMsg, count),
@@ -56,10 +67,20 @@ func TestConcurrentSubmissionResults(t *testing.T) {
 		defer close(readerDone)
 		rsm.readApply()
 	}()
-	defer func() {
-		close(rsm.applyCh)
-		<-readerDone
-	}()
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			close(rsm.applyCh)
+			<-readerDone
+		})
+	}
+	t.Cleanup(stop)
+	return rsm, rf, stop
+}
+
+func TestConcurrentSubmissionResults(t *testing.T) {
+	const count = 32
+	rsm, rf, _ := makeSubmissionRSM(t, count)
 
 	type result struct {
 		want []int
@@ -110,5 +131,66 @@ func TestConcurrentSubmissionResults(t *testing.T) {
 	rsm.mu.Unlock()
 	if remaining != 0 {
 		t.Fatalf("%d completed requests are still pending", remaining)
+	}
+}
+
+func TestSubmissionInterrupted(t *testing.T) {
+	for _, reason := range []string{"follower", "new term", "replaced entry", "shutdown"} {
+		t.Run(reason, func(t *testing.T) {
+			rsm, rf, stop := makeSubmissionRSM(t, 1)
+			result := make(chan rpc.Err, 1)
+			go func() {
+				err, _ := rsm.Submit("old request")
+				result <- err
+			}()
+			var msg raftapi.ApplyMsg
+			select {
+			case msg = <-rf.started:
+			case <-time.After(time.Second):
+				t.Fatal("request did not reach Raft")
+			}
+			switch reason {
+			case "follower":
+				rf.mu.Lock()
+				rf.leader = false
+				rf.mu.Unlock()
+			case "new term":
+				rf.mu.Lock()
+				rf.term++
+				rf.mu.Unlock()
+			case "replaced entry":
+				op := msg.Command.(Op)
+				op.Me++
+				op.Req = "replacement"
+				msg.Command = op
+				rsm.applyCh <- msg
+			case "shutdown":
+				stop()
+			}
+			select {
+			case err := <-result:
+				if err != rpc.ErrWrongLeader {
+					t.Fatalf("interrupted request returned %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("interrupted request did not return")
+			}
+			rsm.mu.Lock()
+			remaining := len(rsm.pending)
+			rsm.mu.Unlock()
+			if remaining != 0 {
+				t.Fatalf("%d interrupted requests are still pending", remaining)
+			}
+			if reason == "shutdown" {
+				if err, _ := rsm.Submit("after shutdown"); err != rpc.ErrWrongLeader {
+					t.Fatalf("request after shutdown returned %v", err)
+				}
+				select {
+				case <-rf.started:
+					t.Fatal("request after shutdown reached Raft")
+				default:
+				}
+			}
+		})
 	}
 }
