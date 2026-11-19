@@ -1,6 +1,8 @@
 package kvraft
 
 import (
+	"sync"
+
 	"6.5840/kvraft1/rsm"
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labgob"
@@ -8,13 +10,42 @@ import (
 	"6.5840/tester1"
 )
 
+type entry struct {
+	value   string
+	version rpc.Tversion
+}
+
 type KVServer struct {
-	me  int
-	rsm *rsm.RSM
+	mu   sync.Mutex
+	me   int
+	rsm  *rsm.RSM
+	data map[string]entry
 }
 
 func (kv *KVServer) DoOp(req any) any {
-	return nil
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	switch args := req.(type) {
+	case rpc.GetArgs:
+		item, ok := kv.data[args.Key]
+		if !ok {
+			return rpc.GetReply{Err: rpc.ErrNoKey}
+		}
+		return rpc.GetReply{Value: item.value, Version: item.version, Err: rpc.OK}
+	case rpc.PutArgs:
+		item, ok := kv.data[args.Key]
+		if !ok && args.Version != 0 {
+			return rpc.PutReply{Err: rpc.ErrNoKey}
+		}
+		if item.version != args.Version {
+			return rpc.PutReply{Err: rpc.ErrVersion}
+		}
+		kv.data[args.Key] = entry{value: args.Value, version: args.Version + 1}
+		return rpc.PutReply{Err: rpc.OK}
+	default:
+		panic("unsupported key/value operation")
+	}
 }
 
 func (kv *KVServer) Snapshot() []byte {
@@ -35,7 +66,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	labgob.Register(rpc.PutArgs{})
 	labgob.Register(rpc.GetArgs{})
 
-	kv := &KVServer{me: me}
+	kv := &KVServer{me: me, data: make(map[string]entry)}
 
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	return []any{kv, kv.rsm.Raft()}
