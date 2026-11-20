@@ -56,9 +56,21 @@ func (kv *KVServer) Restore(data []byte) {
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
+	err, result := kv.rsm.Submit(*args)
+	if err != rpc.OK {
+		*reply = rpc.GetReply{Err: err}
+		return
+	}
+	*reply = result.(rpc.GetReply)
 }
 
 func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
+	err, result := kv.rsm.Submit(*args)
+	if err != rpc.OK {
+		*reply = rpc.PutReply{Err: err}
+		return
+	}
+	*reply = result.(rpc.PutReply)
 }
 
 func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persister *tester.Persister, maxraftstate int) []any {
